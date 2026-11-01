@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use image::{imageops::FilterType, DynamicImage, ImageBuffer, Rgba};
@@ -249,7 +249,7 @@ pub fn render(
                     continue;
                 };
 
-                let file_path = asset_dir.join(&layout_image.file);
+                let file_path = resolve_asset_path(asset_dir, &layout_image.file);
 
                 let image = load_element_image(&file_path).map_err(|error| {
                     format!(
@@ -568,6 +568,35 @@ fn select_element_image(element: &NameElement) -> Option<&LayoutImage> {
         .or_else(|| images.first().copied())
 }
 
+/// The path of `file` in `asset_dir`, matched without regard to case when no entry has its exact name.
+/// MAME opens artwork ZIP entries case-insensitively, and artwork sets store names in a different case
+/// from the ones their layouts give (TorrentZip lowercases them: `screen-topns.png` for a layout's
+/// `Screen-TopNS.png`), so an exact lookup misses them on a case-sensitive filesystem.
+fn resolve_asset_path(asset_dir: &Path, file: &str) -> PathBuf {
+    let exact = asset_dir.join(file);
+    if exact.exists() {
+        return exact;
+    }
+    let Some(name) = Path::new(file).file_name().and_then(|name| name.to_str()) else {
+        return exact;
+    };
+    let dir = exact.parent().unwrap_or(asset_dir);
+    let mut matches = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|candidate| candidate.to_str())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+        });
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => only,
+        _ => exact,
+    }
+}
+
 fn load_element_image(file_path: &Path) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>, String> {
     let is_png = file_path
         .extension()
@@ -825,6 +854,18 @@ fn expand_mask_ids(source: &[Option<u16>], target: RenderTarget) -> Vec<Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_an_artwork_file_stored_in_another_case() {
+        let dir = std::env::temp_dir().join(format!("gnw-case-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("screen-topns.png"), b"x").unwrap();
+        std::fs::write(dir.join("Backdrop.png"), b"x").unwrap();
+        assert_eq!(resolve_asset_path(&dir, "Screen-TopNS.png"), dir.join("screen-topns.png"));
+        assert_eq!(resolve_asset_path(&dir, "Backdrop.png"), dir.join("Backdrop.png"));
+        assert_eq!(resolve_asset_path(&dir, "Missing.png"), dir.join("Missing.png"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn layout_image(file: &str, state: Option<i32>) -> NameElementChildren {
         NameElementChildren::Image(LayoutImage {
